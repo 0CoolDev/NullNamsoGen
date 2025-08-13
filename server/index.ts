@@ -1,0 +1,217 @@
+import express, { type Request, Response, NextFunction } from "express";
+import helmet from "helmet";
+import crypto from "crypto";
+import { registerRoutes } from "./routes";
+import { setupVite, serveStatic, log } from "./vite";
+import { rateLimitMiddleware, authRateLimiter, checkRedisConnection, closeRedisConnection } from "./middleware/rateLimit";
+import { sessionMiddleware, validateSession, closeSessionRedis, sessionSecurityHeaders } from "./middleware/session";
+import { csrfProtection, getCSRFToken } from "./middleware/csrf";
+import { globalErrorHandler } from "./middleware/errorHandler";
+import { compressionMiddleware, staticMiddleware, performanceMonitoring, resourceHints } from "./middleware/performance";
+import { xssClean, sanitizeInputs, preventSQLInjection } from "./middleware/sanitization";
+
+const app = express();
+
+// Trust proxy for accurate IP addresses (important for rate limiting)
+if (process.env.TRUST_PROXY || process.env.NODE_ENV === 'production') {
+  app.set('trust proxy', 1);
+
+// Performance middleware - compression and monitoring
+app.use(compressionMiddleware);
+app.use(performanceMonitoring);
+app.use(resourceHints);
+}
+
+// Generate nonce for CSP
+app.use((req, res, next) => {
+  res.locals.nonce = Buffer.from(crypto.randomBytes(16)).toString('base64');
+  next();
+});
+
+// Enhanced Security headers with Helmet
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", (req, res) => `'nonce-${res.locals.nonce}'`],
+      styleSrc: ["'self'", "'unsafe-inline'"], // Consider using nonce for styles too
+      imgSrc: ["'self'", "data:", "https:"],
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      mediaSrc: ["'self'"],
+      frameSrc: ["'none'"],
+      baseUri: ["'self'"],
+      formAction: ["'self'"],
+      frameAncestors: ["'none'"], // Equivalent to X-Frame-Options: DENY
+      upgradeInsecureRequests: process.env.NODE_ENV === 'production' ? [] : undefined,
+    },
+  },
+  crossOriginEmbedderPolicy: process.env.NODE_ENV === 'production',
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true
+  },
+  noSniff: true, // X-Content-Type-Options: nosniff
+  xssFilter: true,
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+  permittedCrossDomainPolicies: false,
+}));
+
+// Force HTTPS in production (behind proxy)
+if (process.env.NODE_ENV === 'production' || process.env.FORCE_HTTPS === 'true') {
+  app.use((req, res, next) => {
+    if (req.header('x-forwarded-proto') !== 'https') {
+      return res.redirect(`https://${req.header('host')}${req.url}`);
+    }
+    next();
+  });
+}
+
+// Body parsing middleware with size limits
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: false, limit: '10mb' }));
+
+// XSS Clean - remove malicious HTML/JS from user input
+app.use(xssClean);
+
+// Custom input sanitization
+app.use(sanitizeInputs);
+
+// SQL Injection prevention
+app.use(preventSQLInjection);
+
+// Session middleware (must be before CSRF)
+app.use(sessionMiddleware);
+
+// Session security headers
+app.use(sessionSecurityHeaders);
+
+// Session validation
+app.use(validateSession);
+
+// Apply general rate limiting middleware
+app.use(rateLimitMiddleware);
+
+// Apply stricter rate limiting to auth endpoints
+app.use('/api/auth/login', authRateLimiter);
+app.use('/api/auth/register', authRateLimiter);
+
+// CSRF token endpoint (before CSRF protection middleware)
+app.get('/api/csrf-token', getCSRFToken);
+
+// Apply CSRF protection to all routes except GET and specific endpoints
+app.use(csrfProtection);
+
+// Request logging middleware with security considerations
+app.use((req, res, next) => {
+  const start = Date.now();
+  const path = req.path;
+  let capturedJsonResponse: Record<string, any> | undefined = undefined;
+
+  const originalResJson = res.json;
+  res.json = function (bodyJson, ...args) {
+    // Don't log sensitive data
+    const sanitizedBody = { ...bodyJson };
+    if (sanitizedBody.password) sanitizedBody.password = '[REDACTED]';
+    if (sanitizedBody.token) sanitizedBody.token = '[REDACTED]';
+    if (sanitizedBody.csrfToken) sanitizedBody.csrfToken = '[REDACTED]';
+    
+    capturedJsonResponse = sanitizedBody;
+    return originalResJson.apply(res, [bodyJson, ...args]);
+  };
+
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+    if (path.startsWith("/api")) {
+      let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
+      
+      // Only log response body in development
+      if (process.env.NODE_ENV === 'development' && capturedJsonResponse) {
+        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+      }
+
+      if (logLine.length > 80) {
+        logLine = logLine.slice(0, 79) + "…";
+      }
+
+      log(logLine);
+    }
+  });
+
+  next();
+});
+
+// Security headers for API responses
+app.use('/api/*', (req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  next();
+});
+
+(async () => {
+  // Check Redis connection on startup (for future Redis implementation)
+  await checkRedisConnection();
+
+  const server = await registerRoutes(app);
+
+  // Enhanced error handling middleware (must be last)
+  app.use(globalErrorHandler);
+
+  // Setup Vite or static serving
+  if (app.get("env") === "development") {
+    await setupVite(app, server);
+  } else {
+    serveStatic(app);
+    // Add optimized static file serving with cache control
+    app.use(staticMiddleware(import.meta.dirname));
+  }
+
+  // Server configuration
+  const port = parseInt(process.env.PORT || '5000', 10);
+  const host = process.env.HOST || '0.0.0.0';
+  
+  server.listen({
+    port,
+    host,
+    reusePort: true,
+  }, () => {
+    log(`🔐 Secure server running on ${host}:${port}`);
+    log(`✅ Security features enabled:`);
+    log(`   - Rate limiting: 100 req/15min per IP`);
+    log(`   - Input sanitization: XSS protection active`);
+    log(`   - CSRF protection: Token-based validation`);
+    log(`   - Secure headers: Helmet with CSP`);
+    log(`   - Session security: HttpOnly, Secure (prod), SameSite=strict`);
+    if (process.env.NODE_ENV === 'production') {
+      log(`   - HTTPS enforced`);
+    }
+  });
+
+  // Graceful shutdown
+  const gracefulShutdown = async (signal: string) => {
+    log(`${signal} signal received: closing HTTP server and connections`);
+    server.close(() => {
+      log('HTTP server closed');
+    });
+    await closeRedisConnection();
+    await closeSessionRedis();
+    process.exit(0);
+  };
+
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+  
+  // Handle uncaught errors
+  process.on('uncaughtException', (error) => {
+    console.error('Uncaught Exception:', error);
+    gracefulShutdown('uncaughtException');
+  });
+  
+  process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  });
+})();
